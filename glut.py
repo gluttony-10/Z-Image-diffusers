@@ -1,8 +1,5 @@
-import io
 import os
 import gc
-import json
-import math
 from mmgp import offload
 import torch
 import numpy as np
@@ -11,7 +8,6 @@ import socket
 import psutil
 import random
 import argparse
-import requests
 import datetime
 from diffusers import ZImagePipeline, ZImageTransformer2DModel
 from transformers import Qwen3Model
@@ -69,7 +65,7 @@ pipe = ZImagePipeline.from_pretrained(
     torch_dtype=dtype,
     low_cpu_mem_usage=False, 
 )
-text_encoder._dtype = dtype 
+#text_encoder._dtype = dtype 
 mmgp = offload.all(
     pipe, 
     pinnedMemory= ["text_encoder", "transformer"],
@@ -97,43 +93,6 @@ def find_port(port: int) -> int:
             return find_port(port=port + 1)
         else:
             return port
-
-
-def save_token_to_file(token):
-    """将 token 保存到 token.json 文件"""
-    try:
-        with open("token.json", "w") as f:
-            json.dump({"hf_token": token}, f)
-        return True
-    except Exception as e:
-        print(f"保存 token 失败: {str(e)}")
-        return False
-
-
-def load_token_from_file():
-    """从 token.json 文件加载 token，如果文件不存在则返回空字符串"""
-    try:
-        if os.path.exists("token.json"):
-            with open("token.json", "r") as f:
-                data = json.load(f)
-                return data.get("hf_token", "")
-    except Exception as e:
-        print(f"加载 token 失败: {str(e)}")
-    return ""
-
-
-def remote_text_encoder(prompts, hf_token):
-    response = requests.post(
-        "https://remote-text-encoder-flux-2.huggingface.co/predict",
-        json={"prompt": prompts},
-        headers={
-            "Authorization": f"Bearer {hf_token}",
-            "Content-Type": "application/json"
-        }
-    )
-    prompt_embeds = torch.load(io.BytesIO(response.content))
-
-    return prompt_embeds.to(device)
         
 
 def exchange_width_height(width, height):
@@ -155,24 +114,6 @@ def scale_resolution_1_5(width, height):
     return new_width, new_height, "✅ 分辨率已调整为1.5倍"
 
 
-def adjust_width_height(image):
-    image_width, image_height = image.size
-    vae_width, vae_height = calculate_dimensions(1024*1024, image_width / image_height)
-    calculated_height = vae_height // 32 * 32
-    calculated_width = vae_width // 32 * 32
-    return int(calculated_width), int(calculated_height), "✅ 根据图片调整宽高"
-
-
-def calculate_dimensions(target_area, ratio):
-    width = math.sqrt(target_area * ratio)
-    height = width / ratio
-
-    width = round(width / 32) * 32
-    height = round(height / 32) * 32
-
-    return width, height
-
-
 def generate(
     prompt, 
     width, 
@@ -187,6 +128,7 @@ def generate(
         seed = random.randint(0, np.iinfo(np.int32).max)
     else:
         seed = seed_param
+    prompt_embeds, _ = pipe.encode_prompt(prompt)
     for i in range(batch_images):
         if stop_generation:
             stop_generation = False
@@ -195,12 +137,12 @@ def generate(
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"outputs/{timestamp}.png"
         output = pipe(
-            prompt=prompt,
             height=height,
             width=width,
             num_inference_steps=num_inference_steps, 
             guidance_scale=0.0, 
             generator=torch.Generator().manual_seed(seed+i),
+            prompt_embeds=prompt_embeds,
         )
         image = output.images[0]
         image.save(filename)
@@ -271,6 +213,11 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
         fn=scale_resolution_1_5,
         inputs=[width, height],
         outputs=[width, height, info]
+    )
+    stop_button.click(
+        fn=stop_generate, 
+        inputs=[], 
+        outputs=[info]
     )
 
 if __name__ == "__main__": 
