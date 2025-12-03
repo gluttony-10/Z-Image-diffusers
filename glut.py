@@ -53,9 +53,16 @@ stop_generation = False
 mode_loaded = None
 pipe = None
 mmgp =None
+lora_loaded = None
+lora_loaded_weights = None
+lora_dir = "models/lora"
+if os.path.exists(lora_dir):
+    lora_files = [f for f in os.listdir(lora_dir) if f.endswith(".safetensors")]
+    lora_choices = sorted(lora_files)
+else:
+    lora_choices = []
 
-
-def load_model(mode):
+def load_model(mode, lora_dropdown, lora_weights):
     global pipe, mmgp
     text_encoder = offload.fast_load_transformers_model(
         f"{repo_id}/text_encoder/mmgp.safetensors",
@@ -80,6 +87,7 @@ def load_model(mode):
             torch_dtype=dtype,
             low_cpu_mem_usage=False, 
         )
+        load_lora(lora_dropdown, lora_weights)
     elif mode == "con":
         if pipe is not None:
             mmgp.release()
@@ -113,6 +121,7 @@ def load_model(mode):
         extraModelsToQuantize = ["text_encoder"],
         compile=True if args.compile else False,
     )
+    pipe.transformer.set_attention_backend("flash")
     """offload.save_model(
         model=pipe.transformer, 
         file_path=f"{repo_id}/transformer/mmgp.safetensors", 
@@ -123,6 +132,26 @@ def load_model(mode):
         file_path=f"{repo_id}/text_encoder/mmgp.safetensors", 
         #config_file_path=f"{repo_id}/text_encoder/config.json",
     )"""
+
+
+def load_lora(lora_dropdown, lora_weights):
+    if lora_dropdown != []:
+        global pipe
+        adapter_names = []
+        weightss = []
+        weights = [float(w) for w in lora_weights.split(',')] if lora_weights else []
+        for idx, lora_name in enumerate(lora_dropdown):
+            try:
+                adapter_name = os.path.splitext(os.path.basename(lora_name))[0]
+                adapter_names.append(adapter_name)
+                weight = weights[idx] if idx < len(weights) else 1.0
+                weightss.append(weight)
+                pipe.load_lora_weights(f"models/lora/{lora_name}", adapter_name=adapter_name)
+                print(f"✅ 已加载LoRA模型: {lora_name} (权重: {weight})")
+            except Exception as e:
+                print(f"❌ 加载{adapter_name}失败: {str(e)}")
+        pipe.set_adapters(adapter_names, adapter_weights=weightss)
+        print("LoRA加载完成")
 
 # 解决冲突端口（感谢licyk酱提供的代码~）
 def find_port(port: int) -> int:
@@ -177,11 +206,14 @@ def generate_t2i(
     num_inference_steps, 
     batch_images, 
     seed_param, 
+    lora_dropdown, 
+    lora_weights,
 ):
-    global stop_generation, mode_loaded
-    if mode_loaded != "t2i":
-        load_model("t2i")
+    global stop_generation, mode_loaded, lora_loaded, lora_loaded_weights
+    if mode_loaded != "t2i" or lora_loaded != lora_dropdown or lora_loaded_weights != lora_weights:
+        load_model("t2i", lora_dropdown, lora_weights)
         mode_loaded = "t2i"
+        lora_loaded, lora_loaded_weights = lora_dropdown, lora_weights
     results = []
     if seed_param < 0:
         seed = random.randint(0, np.iinfo(np.int32).max)
@@ -225,7 +257,7 @@ def generate_con(
 ):
     global stop_generation, mode_loaded
     if mode_loaded != "con":
-        load_model("con")
+        load_model("con", None, None)
         mode_loaded = "con"
     results = []
     if seed_param < 0:
@@ -276,7 +308,11 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                 ⚠️ 该演示仅供学术研究和体验使用。
             </div>
             """)
-    
+    with gr.Accordion("LoRA设置(仅文生图可用)", open=False):
+        with gr.Column():
+            with gr.Row():
+                lora_dropdown = gr.Dropdown(label="LoRA模型", info="存放LoRA模型到models/lora，可多选", choices=lora_choices, multiselect=True)
+                lora_weights = gr.Textbox(label="LoRA权重", info="Lora权重，多个权重请用英文逗号隔开。例如：0.8,0.5,0.2", value="")
     with gr.Tabs():
         with gr.TabItem("文生图"):
             with gr.Row():
@@ -329,6 +365,8 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
             num_inference_steps_t2i,
             batch_images_t2i,
             seed_param_t2i,
+            lora_dropdown, 
+            lora_weights,
         ],
         outputs = [image_output_t2i, info_t2i]
     )
