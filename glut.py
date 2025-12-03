@@ -1,5 +1,6 @@
 import os
 import gc
+import math
 from mmgp import offload
 import torch
 import numpy as np
@@ -9,8 +10,12 @@ import psutil
 import random
 import argparse
 import datetime
-from diffusers import ZImagePipeline, ZImageTransformer2DModel
+from diffusers import ZImagePipeline, ZImageTransformer2DModel, FlowMatchEulerDiscreteScheduler
+from videox_fun.utils.utils import get_image_latent
+from videox_fun.models import AutoencoderKL, AutoTokenizer, Qwen3ForCausalLM, ZImageControlTransformer2DModel
+from videox_fun.pipeline import ZImageControlPipeline
 from transformers import Qwen3Model
+from safetensors.torch import load_file
 
 
 parser = argparse.ArgumentParser() 
@@ -52,7 +57,7 @@ text_encoder = offload.fast_load_transformers_model(
     modelClass=Qwen3Model,
     forcedConfigPath=f"{repo_id}/text_encoder/config.json",
 )
-transformer = offload.fast_load_transformers_model(
+"""transformer = offload.fast_load_transformers_model(
     f"{repo_id}/transformer/mmgp.safetensors",
     do_quantize=False,
     modelClass=ZImageTransformer2DModel,
@@ -64,6 +69,29 @@ pipe = ZImagePipeline.from_pretrained(
     transformer=transformer,
     torch_dtype=dtype,
     low_cpu_mem_usage=False, 
+)"""
+"""transformer = ZImageControlTransformer2DModel.from_pretrained(
+    repo_id, 
+    subfolder="transformer",
+    low_cpu_mem_usage=True,
+    torch_dtype=dtype,
+)
+state_dict = load_file("./models/Z-Image-Turbo-Fun-Controlnet-Union/Z-Image-Turbo-Fun-Controlnet-Union.safetensors")
+state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+m, u = transformer.load_state_dict(state_dict, strict=False)
+print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")"""
+transformer = offload.fast_load_transformers_model(
+    f"{repo_id}/transformer/mmgp2.safetensors",
+    do_quantize=False,
+    modelClass=ZImageControlTransformer2DModel,
+    forcedConfigPath=f"{repo_id}/transformer/config.json",
+)
+pipe = ZImageControlPipeline.from_pretrained(
+    repo_id, 
+    text_encoder=text_encoder,
+    transformer=transformer,
+    torch_dtype=dtype,
+    low_cpu_mem_usage=False,
 )
 #text_encoder._dtype = dtype 
 mmgp = offload.all(
@@ -99,6 +127,22 @@ def exchange_width_height(width, height):
     return height, width, "✅ 宽高交换完毕"
 
 
+def adjust_width_height(image):
+    image_width, image_height = image.size
+    vae_width, vae_height = calculate_dimensions(1024*1024, image_width / image_height)
+    calculated_height = vae_height // 32 * 32
+    calculated_width = vae_width // 32 * 32
+    return int(calculated_width), int(calculated_height), "✅ 根据图片调整宽高"
+
+
+def calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+    return width, height
+
+
 def stop_generate():
     global stop_generation
     stop_generation = True
@@ -114,7 +158,7 @@ def scale_resolution_1_5(width, height):
     return new_width, new_height, "✅ 分辨率已调整为1.5倍"
 
 
-def generate(
+def generate_t2i(
     prompt, 
     width, 
     height, 
@@ -152,6 +196,51 @@ def generate(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+
+
+def generate_con(
+    control_image,
+    prompt, 
+    width, 
+    height, 
+    num_inference_steps, 
+    strength,
+    batch_images, 
+    seed_param, 
+):
+    global stop_generation
+    results = []
+    if seed_param < 0:
+        seed = random.randint(0, np.iinfo(np.int32).max)
+    else:
+        seed = seed_param
+    prompt_embeds, _ = pipe.encode_prompt(prompt)
+    control_image = get_image_latent(control_image, sample_size=[height, width])[:, :, 0]
+    for i in range(batch_images):
+        if stop_generation:
+            stop_generation = False
+            yield results, f"✅ 生成已中止，最后种子数{seed+i-1}"
+            break
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"outputs/{timestamp}.png"
+        output = pipe(
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps, 
+            guidance_scale=0.0, 
+            generator=torch.Generator().manual_seed(seed+i),
+            prompt_embeds=prompt_embeds,
+            control_image = control_image,
+            control_context_scale = strength,
+        )
+        image = output.images[0]
+        image.save(filename)
+        results.append(image)
+        yield results, f"种子数{seed+i}，保存地址{filename}"
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
     
 
 with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.GoogleFont("IBM Plex Sans")])) as demo:
@@ -171,53 +260,110 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
             """)
     
     with gr.Tabs():
-        with gr.TabItem("Z-Image-diffusers"):
+        with gr.TabItem("文生图"):
             with gr.Row():
                 with gr.Column():
-                    prompt = gr.Textbox(label="提示词", placeholder="请输入提示词...")
-                    generate_button = gr.Button("🎬 开始生成", variant='primary', scale=4)
+                    prompt_t2i = gr.Textbox(label="提示词", placeholder="请输入提示词...")
+                    generate_button_t2i = gr.Button("🖼️ 开始生成", variant='primary', scale=4)
                     with gr.Accordion("参数设置", open=True):
                         with gr.Row():
-                            width = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
-                            height = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
+                            width_t2i = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
+                            height_t2i = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
                         with gr.Row():
-                            exchange_button = gr.Button("🔄 交换宽高")
-                            scale_1_5_button = gr.Button("1.5倍分辨率")
-                        batch_images = gr.Slider(label="批量生成", minimum=1, maximum=100, step=1, value=1)
-                        num_inference_steps = gr.Slider(label="采样步数（推荐9步）", minimum=1, maximum=100, step=1, value=9)
-                        seed_param = gr.Number(label="种子，请输入自然数，-1为随机", value=-1)
+                            exchange_button_t2i = gr.Button("🔄 交换宽高")
+                            scale_1_5_button_t2i = gr.Button("1.5倍分辨率")
+                        batch_images_t2i = gr.Slider(label="批量生成", minimum=1, maximum=100, step=1, value=1)
+                        num_inference_steps_t2i = gr.Slider(label="采样步数（推荐9步）", minimum=1, maximum=100, step=1, value=9)
+                        seed_param_t2i = gr.Number(label="种子，请输入自然数，-1为随机", value=-1)
                 with gr.Column():
-                    info = gr.Textbox(label="提示信息", interactive=False)
-                    image_output = gr.Gallery(label="生成结果", interactive=False)
-                    stop_button = gr.Button("中止生成", variant="stop")
+                    info_t2i = gr.Textbox(label="提示信息", interactive=False)
+                    image_output_t2i = gr.Gallery(label="生成结果", interactive=False)
+                    stop_button_t2i = gr.Button("中止生成", variant="stop")
+        with gr.TabItem("ControlNet"):
+            with gr.Row():
+                with gr.Column():
+                    image_con = gr.Image(label="输入控制图片（支持Canny、HED、Depth、Pose、MLSD）", type="pil", height=300)
+                    prompt_con = gr.Textbox(label="提示词", placeholder="请输入提示词...")
+                    generate_button_con = gr.Button("🖼️ 开始生成", variant='primary', scale=4)
+                    with gr.Accordion("参数设置", open=True):
+                        with gr.Row():
+                            width_con = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
+                            height_con = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
+                        with gr.Row():
+                            exchange_button_con = gr.Button("🔄 交换宽高")
+                            scale_1_5_button_con = gr.Button("1.5倍分辨率")
+                        strength_con = gr.Slider(label="strength（推荐0.75）", minimum=0, maximum=1, step=0.01, value=0.75)
+                        batch_images_con = gr.Slider(label="批量生成", minimum=1, maximum=100, step=1, value=1)
+                        num_inference_steps_con = gr.Slider(label="采样步数（推荐9步）", minimum=1, maximum=100, step=1, value=9)
+                        seed_param_con = gr.Number(label="种子，请输入自然数，-1为随机", value=-1)
+                with gr.Column():
+                    info_con = gr.Textbox(label="提示信息", interactive=False)
+                    image_output_con = gr.Gallery(label="生成结果", interactive=False)
+                    stop_button_con = gr.Button("中止生成", variant="stop")
         
     gr.on(
-        triggers=[generate_button.click, prompt.submit],
-        fn = generate,
+        triggers=[generate_button_t2i.click, prompt_t2i.submit],
+        fn = generate_t2i,
         inputs = [
-            prompt,
-            width,
-            height,
-            num_inference_steps,
-            batch_images,
-            seed_param,
+            prompt_t2i,
+            width_t2i,
+            height_t2i,
+            num_inference_steps_t2i,
+            batch_images_t2i,
+            seed_param_t2i,
         ],
-        outputs = [image_output, info]
+        outputs = [image_output_t2i, info_t2i]
     )
-    exchange_button.click(
+    exchange_button_t2i.click(
         fn=exchange_width_height, 
-        inputs=[width, height], 
-        outputs=[width, height, info]
+        inputs=[width_t2i, height_t2i], 
+        outputs=[width_t2i, height_t2i, info_t2i]
     )
-    scale_1_5_button.click(
+    scale_1_5_button_t2i.click(
         fn=scale_resolution_1_5,
-        inputs=[width, height],
-        outputs=[width, height, info]
+        inputs=[width_t2i, height_t2i],
+        outputs=[width_t2i, height_t2i, info_t2i]
     )
-    stop_button.click(
+    stop_button_t2i.click(
         fn=stop_generate, 
         inputs=[], 
-        outputs=[info]
+        outputs=[info_t2i]
+    )
+    # ControlNet
+    gr.on(
+        triggers=[generate_button_con.click, prompt_con.submit],
+        fn = generate_con,
+        inputs = [
+            image_con,
+            prompt_con,
+            width_con,
+            height_con,
+            num_inference_steps_con,
+            strength_con,
+            batch_images_con,
+            seed_param_con,
+        ],
+        outputs = [image_output_con, info_con]
+    )
+    exchange_button_con.click(
+        fn=exchange_width_height, 
+        inputs=[width_con, height_con], 
+        outputs=[width_con, height_con, info_con]
+    )
+    scale_1_5_button_con.click(
+        fn=scale_resolution_1_5,
+        inputs=[width_con, height_con],
+        outputs=[width_con, height_con, info_con]
+    )
+    stop_button_con.click(
+        fn=stop_generate, 
+        inputs=[], 
+        outputs=[info_con]
+    )
+    image_con.upload(
+        fn=adjust_width_height, 
+        inputs=[image_con], 
+        outputs=[width_con, height_con, info_con]
     )
 
 if __name__ == "__main__": 

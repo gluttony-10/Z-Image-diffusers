@@ -11,3 +11,8 @@ mmgp
 peft
 openai
 modelscope
+librosa
+opencv-python
+imageio
+einops
+decord

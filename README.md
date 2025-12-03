@@ -25,4 +25,6 @@ modelscope download --model Gluttony10/Z-Image-diffusers --local_dir ./models
 python glut.py
 ```
 ## 参考项目
-[Z-Image](https://github.com/Tongyi-MAI/Z-Image)
+https://github.com/Tongyi-MAI/Z-Image
+
+https://github.com/aigc-apps/VideoX-Fun
