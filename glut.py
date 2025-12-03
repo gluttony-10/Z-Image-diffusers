@@ -50,67 +50,79 @@ os.makedirs("outputs", exist_ok=True)
 repo_id = "./models/Z-Image-Turbo"
 budgets = int(torch.cuda.get_device_properties(0).total_memory/1048576 - args.res_vram)
 stop_generation = False
+mode_loaded = None
+pipe = None
+mmgp =None
 
-text_encoder = offload.fast_load_transformers_model(
-    f"{repo_id}/text_encoder/mmgp.safetensors",
-    do_quantize=False,
-    modelClass=Qwen3Model,
-    forcedConfigPath=f"{repo_id}/text_encoder/config.json",
-)
-"""transformer = offload.fast_load_transformers_model(
-    f"{repo_id}/transformer/mmgp.safetensors",
-    do_quantize=False,
-    modelClass=ZImageTransformer2DModel,
-    forcedConfigPath=f"{repo_id}/transformer/config.json",
-)
-pipe = ZImagePipeline.from_pretrained(
-    repo_id, 
-    text_encoder=text_encoder,
-    transformer=transformer,
-    torch_dtype=dtype,
-    low_cpu_mem_usage=False, 
-)"""
-"""transformer = ZImageControlTransformer2DModel.from_pretrained(
-    repo_id, 
-    subfolder="transformer",
-    low_cpu_mem_usage=True,
-    torch_dtype=dtype,
-)
-state_dict = load_file("./models/Z-Image-Turbo-Fun-Controlnet-Union/Z-Image-Turbo-Fun-Controlnet-Union.safetensors")
-state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
-m, u = transformer.load_state_dict(state_dict, strict=False)
-print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")"""
-transformer = offload.fast_load_transformers_model(
-    f"{repo_id}/transformer/mmgp2.safetensors",
-    do_quantize=False,
-    modelClass=ZImageControlTransformer2DModel,
-    forcedConfigPath=f"{repo_id}/transformer/config.json",
-)
-pipe = ZImageControlPipeline.from_pretrained(
-    repo_id, 
-    text_encoder=text_encoder,
-    transformer=transformer,
-    torch_dtype=dtype,
-    low_cpu_mem_usage=False,
-)
-#text_encoder._dtype = dtype 
-mmgp = offload.all(
-    pipe, 
-    pinnedMemory= ["text_encoder", "transformer"],
-    budgets={'*': budgets}, 
-    extraModelsToQuantize = ["text_encoder"],
-    compile=True if args.compile else False,
-)
-"""offload.save_model(
-    model=pipe.transformer, 
-    file_path=f"{repo_id}/transformer/mmgp.safetensors", 
-    config_file_path=f"{repo_id}/transformer/config.json",
-)
-offload.save_model(
-    model=pipe.text_encoder, 
-    file_path=f"{repo_id}/text_encoder/mmgp.safetensors", 
-    #config_file_path=f"{repo_id}/text_encoder/config.json",
-)"""
+
+def load_model(mode):
+    global pipe, mmgp
+    text_encoder = offload.fast_load_transformers_model(
+        f"{repo_id}/text_encoder/mmgp.safetensors",
+        do_quantize=False,
+        modelClass=Qwen3Model,
+        forcedConfigPath=f"{repo_id}/text_encoder/config.json",
+    )
+    #text_encoder._dtype = dtype 
+    if mode == "t2i":
+        if pipe is not None:
+            mmgp.release()
+        transformer = offload.fast_load_transformers_model(
+            f"{repo_id}/transformer/mmgp.safetensors",
+            do_quantize=False,
+            modelClass=ZImageTransformer2DModel,
+            forcedConfigPath=f"{repo_id}/transformer/config.json",
+        )
+        pipe = ZImagePipeline.from_pretrained(
+            repo_id, 
+            text_encoder=text_encoder,
+            transformer=transformer,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=False, 
+        )
+    elif mode == "con":
+        if pipe is not None:
+            mmgp.release()
+        """transformer = ZImageControlTransformer2DModel.from_pretrained(
+            repo_id, 
+            subfolder="transformer",
+            low_cpu_mem_usage=True,
+            torch_dtype=dtype,
+        )
+        state_dict = load_file("./models/Z-Image-Turbo-Fun-Controlnet-Union/Z-Image-Turbo-Fun-Controlnet-Union.safetensors")
+        state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
+        m, u = transformer.load_state_dict(state_dict, strict=False)
+        print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")"""
+        transformer = offload.fast_load_transformers_model(
+            f"{repo_id}/transformer/mmgp2.safetensors",
+            do_quantize=False,
+            modelClass=ZImageControlTransformer2DModel,
+            forcedConfigPath=f"{repo_id}/transformer/config.json",
+        )
+        pipe = ZImageControlPipeline.from_pretrained(
+            repo_id, 
+            text_encoder=text_encoder,
+            transformer=transformer,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=False,
+        )
+    mmgp = offload.all(
+        pipe, 
+        pinnedMemory= ["text_encoder", "transformer"],
+        budgets={'*': budgets}, 
+        extraModelsToQuantize = ["text_encoder"],
+        compile=True if args.compile else False,
+    )
+    """offload.save_model(
+        model=pipe.transformer, 
+        file_path=f"{repo_id}/transformer/mmgp.safetensors", 
+        config_file_path=f"{repo_id}/transformer/config.json",
+    )
+    offload.save_model(
+        model=pipe.text_encoder, 
+        file_path=f"{repo_id}/text_encoder/mmgp.safetensors", 
+        #config_file_path=f"{repo_id}/text_encoder/config.json",
+    )"""
 
 # 解决冲突端口（感谢licyk酱提供的代码~）
 def find_port(port: int) -> int:
@@ -166,7 +178,10 @@ def generate_t2i(
     batch_images, 
     seed_param, 
 ):
-    global stop_generation
+    global stop_generation, mode_loaded
+    if mode_loaded != "t2i":
+        load_model("t2i")
+        mode_loaded = "t2i"
     results = []
     if seed_param < 0:
         seed = random.randint(0, np.iinfo(np.int32).max)
@@ -208,7 +223,10 @@ def generate_con(
     batch_images, 
     seed_param, 
 ):
-    global stop_generation
+    global stop_generation, mode_loaded
+    if mode_loaded != "con":
+        load_model("con")
+        mode_loaded = "con"
     results = []
     if seed_param < 0:
         seed = random.randint(0, np.iinfo(np.int32).max)
