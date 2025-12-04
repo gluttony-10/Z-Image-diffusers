@@ -10,9 +10,9 @@ import psutil
 import random
 import argparse
 import datetime
-from diffusers import ZImagePipeline, ZImageTransformer2DModel, FlowMatchEulerDiscreteScheduler
+from diffusers import ZImagePipeline, ZImageTransformer2DModel
 from videox_fun.utils.utils import get_image_latent
-from videox_fun.models import AutoencoderKL, AutoTokenizer, Qwen3ForCausalLM, ZImageControlTransformer2DModel
+from videox_fun.models import ZImageControlTransformer2DModel
 from videox_fun.pipeline import ZImageControlPipeline
 from transformers import Qwen3Model
 from safetensors.torch import load_file
@@ -52,7 +52,7 @@ budgets = int(torch.cuda.get_device_properties(0).total_memory/1048576 - args.re
 stop_generation = False
 mode_loaded = None
 pipe = None
-mmgp =None
+mmgp = None
 lora_loaded = None
 lora_loaded_weights = None
 lora_dir = "models/lora"
@@ -114,6 +114,7 @@ def load_model(mode, lora_dropdown, lora_weights):
             torch_dtype=dtype,
             low_cpu_mem_usage=False,
         )
+        load_lora(lora_dropdown, lora_weights)
     mmgp = offload.all(
         pipe, 
         pinnedMemory= ["text_encoder", "transformer"],
@@ -141,15 +142,12 @@ def load_lora(lora_dropdown, lora_weights):
         weightss = []
         weights = [float(w) for w in lora_weights.split(',')] if lora_weights else []
         for idx, lora_name in enumerate(lora_dropdown):
-            try:
                 adapter_name = os.path.splitext(os.path.basename(lora_name))[0]
                 adapter_names.append(adapter_name)
                 weight = weights[idx] if idx < len(weights) else 1.0
                 weightss.append(weight)
                 pipe.load_lora_weights(f"models/lora/{lora_name}", adapter_name=adapter_name)
                 print(f"✅ 已加载LoRA模型: {lora_name} (权重: {weight})")
-            except Exception as e:
-                print(f"❌ 加载{adapter_name}失败: {str(e)}")
         pipe.set_adapters(adapter_names, adapter_weights=weightss)
         print("LoRA加载完成")
 
@@ -254,11 +252,14 @@ def generate_con(
     strength,
     batch_images, 
     seed_param, 
+    lora_dropdown, 
+    lora_weights,
 ):
-    global stop_generation, mode_loaded
-    if mode_loaded != "con":
-        load_model("con", None, None)
+    global stop_generation, mode_loaded, lora_loaded, lora_loaded_weights
+    if mode_loaded != "con" or lora_loaded != lora_dropdown or lora_loaded_weights != lora_weights:
+        load_model("con", lora_dropdown, lora_weights)
         mode_loaded = "con"
+        lora_loaded, lora_loaded_weights = lora_dropdown, lora_weights
     results = []
     if seed_param < 0:
         seed = random.randint(0, np.iinfo(np.int32).max)
@@ -398,6 +399,8 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
             strength_con,
             batch_images_con,
             seed_param_con,
+            lora_dropdown, 
+            lora_weights,
         ],
         outputs = [image_output_con, info_con]
     )

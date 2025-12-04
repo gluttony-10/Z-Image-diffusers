@@ -334,7 +334,7 @@ class RopeEmbedder:
         return torch.cat(result, dim=-1)
 
 
-class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+class ZImageTransformer2DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapterMixin):
     _supports_gradient_checkpointing = True
     # _no_split_modules = ["ZImageTransformerBlock"]
     # _skip_layerwise_casting_patterns = ["t_embedder", "cap_embedder"]  # precision sensitive layers

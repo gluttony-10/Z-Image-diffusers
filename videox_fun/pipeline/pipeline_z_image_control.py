@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.loaders import FromSingleFileMixin
+from diffusers.loaders import FromSingleFileMixin, ZImageLoraLoaderMixin
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils import (BaseOutput, is_torch_xla_available, logging,
@@ -152,7 +152,7 @@ class ZImagePipelineOutput(BaseOutput):
     images: Union[List[PIL.Image.Image], np.ndarray]
 
 
-class ZImageControlPipeline(DiffusionPipeline, FromSingleFileMixin):
+class ZImageControlPipeline(DiffusionPipeline, ZImageLoraLoaderMixin, FromSingleFileMixin):
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     _optional_components = []
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
