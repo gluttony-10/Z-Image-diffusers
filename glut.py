@@ -309,7 +309,7 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                 ⚠️ 该演示仅供学术研究和体验使用。
             </div>
             """)
-    with gr.Accordion("LoRA设置(仅文生图可用)", open=False):
+    with gr.Accordion("LoRA设置", open=False):
         with gr.Column():
             with gr.Row():
                 lora_dropdown = gr.Dropdown(label="LoRA模型", info="存放LoRA模型到models/lora，可多选", choices=lora_choices, multiselect=True)
