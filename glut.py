@@ -1,5 +1,6 @@
 import os
 import gc
+from PIL import Image
 import math
 from mmgp import offload
 import torch
@@ -10,7 +11,8 @@ import psutil
 import random
 import argparse
 import datetime
-from diffusers import ZImagePipeline, ZImageTransformer2DModel
+from diffusers import ZImagePipeline, ZImageTransformer2DModel, ZImageImg2ImgPipeline
+from diffusers.utils import load_image
 from videox_fun.utils.utils import get_image_latent
 from videox_fun.models import ZImageControlTransformer2DModel
 from videox_fun.pipeline import ZImageControlPipeline
@@ -40,8 +42,8 @@ if torch.cuda.is_available():
         print(f'\033[32m支持BF16\033[0m')
         dtype = torch.bfloat16
     else:
-        print(f'\033[32m不支持BF16，仅支持FP16\033[0m')
-        dtype = torch.float16
+        print(f'\033[32m不支持BF16，尝试使用FP32\033[0m')
+        dtype = torch.float32
 else:
     print(f'\033[32mCUDA不可用，请检查\033[0m')
     device = "cpu"
@@ -88,21 +90,37 @@ def load_model(mode, lora_dropdown, lora_weights):
             low_cpu_mem_usage=False, 
         )
         load_lora(lora_dropdown, lora_weights)
+    elif mode == "i2i":
+        if pipe is not None:
+            mmgp.release()
+        transformer = offload.fast_load_transformers_model(
+            f"{repo_id}/transformer/mmgp.safetensors",
+            do_quantize=False,
+            modelClass=ZImageTransformer2DModel,
+            forcedConfigPath=f"{repo_id}/transformer/config.json",
+        )
+        pipe = ZImageImg2ImgPipeline.from_pretrained(
+            repo_id, 
+            text_encoder=text_encoder,
+            transformer=transformer,
+            torch_dtype=dtype,
+            low_cpu_mem_usage=False, 
+        )
+        load_lora(lora_dropdown, lora_weights)
     elif mode == "con":
         if pipe is not None:
             mmgp.release()
         """transformer = ZImageControlTransformer2DModel.from_pretrained(
             repo_id, 
             subfolder="transformer",
-            low_cpu_mem_usage=True,
             torch_dtype=dtype,
         )
-        state_dict = load_file("./models/Z-Image-Turbo-Fun-Controlnet-Union/Z-Image-Turbo-Fun-Controlnet-Union.safetensors")
+        state_dict = load_file("./models/Z-Image-Turbo-Fun-Controlnet-Union-2.0.safetensors")
         state_dict = state_dict["state_dict"] if "state_dict" in state_dict else state_dict
         m, u = transformer.load_state_dict(state_dict, strict=False)
         print(f"missing keys: {len(m)}, unexpected keys: {len(u)}")"""
         transformer = offload.fast_load_transformers_model(
-            f"{repo_id}/transformer/mmgp2.safetensors",
+            f"{repo_id}/transformer/mmgp-con.safetensors",
             do_quantize=False,
             modelClass=ZImageControlTransformer2DModel,
             forcedConfigPath=f"{repo_id}/transformer/config.json",
@@ -122,16 +140,19 @@ def load_model(mode, lora_dropdown, lora_weights):
         extraModelsToQuantize = ["text_encoder"],
         compile=True if args.compile else False,
     )
-    pipe.transformer.set_attention_backend("flash")
+    if torch.cuda.get_device_capability()[0] >= 8:
+        pipe.transformer.set_attention_backend("flash")
+    else:
+        pipe.transformer.set_attention_backend("native")
     """offload.save_model(
         model=pipe.transformer, 
-        file_path=f"{repo_id}/transformer/mmgp.safetensors", 
+        file_path=f"{repo_id}/transformer/mmgp-con.safetensors", 
         config_file_path=f"{repo_id}/transformer/config.json",
-    )
-    offload.save_model(
+    )"""
+    """offload.save_model(
         model=pipe.text_encoder, 
         file_path=f"{repo_id}/text_encoder/mmgp.safetensors", 
-        #config_file_path=f"{repo_id}/text_encoder/config.json",
+        config_file_path=f"{repo_id}/text_encoder/config.json",
     )"""
 
 
@@ -243,8 +264,60 @@ def generate_t2i(
             torch.cuda.ipc_collect()
 
 
+def generate_i2i(
+    init_image,
+    prompt, 
+    width, 
+    height, 
+    strength,
+    num_inference_steps, 
+    batch_images, 
+    seed_param, 
+    lora_dropdown, 
+    lora_weights,
+):
+    global stop_generation, mode_loaded, lora_loaded, lora_loaded_weights
+    if mode_loaded != "i2i" or lora_loaded != lora_dropdown or lora_loaded_weights != lora_weights:
+        load_model("i2i", lora_dropdown, lora_weights)
+        mode_loaded = "i2i"
+        lora_loaded, lora_loaded_weights = lora_dropdown, lora_weights
+    results = []
+    if seed_param < 0:
+        seed = random.randint(0, np.iinfo(np.int32).max)
+    else:
+        seed = seed_param
+    #prompt_embeds, _ = pipe.encode_prompt(prompt)
+    if init_image.size != (width, height):
+        init_image = init_image.resize((width, height))
+    for i in range(batch_images):
+        if stop_generation:
+            stop_generation = False
+            yield results, f"✅ 生成已中止，最后种子数{seed+i-1}"
+            break
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"outputs/{timestamp}.png"
+        output = pipe(
+            image=init_image,
+            prompt=prompt,
+            height=height,
+            width=width,
+            strength=strength,
+            num_inference_steps=num_inference_steps, 
+            guidance_scale=0.0, 
+            generator=torch.Generator().manual_seed(seed+i),
+            #prompt_embeds=prompt_embeds,
+        )
+        image = output.images[0]
+        image.save(filename)
+        results.append(image)
+        yield results, f"种子数{seed+i}，保存地址{filename}"
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+
 def generate_con(
-    control_image,
     prompt, 
     width, 
     height, 
@@ -254,6 +327,8 @@ def generate_con(
     seed_param, 
     lora_dropdown, 
     lora_weights,
+    control_image=None,
+    image=None,
 ):
     global stop_generation, mode_loaded, lora_loaded, lora_loaded_weights
     if mode_loaded != "con" or lora_loaded != lora_dropdown or lora_loaded_weights != lora_weights:
@@ -266,7 +341,28 @@ def generate_con(
     else:
         seed = seed_param
     prompt_embeds, _ = pipe.encode_prompt(prompt)
-    control_image = get_image_latent(control_image, sample_size=[height, width])[:, :, 0]
+    if image["background"] is not None:
+        # 处理蒙版图像
+        mask_image = image["layers"][0]
+        mask_image = mask_image .convert("RGBA")
+        data = np.array(mask_image)
+        # 修改蒙版颜色（黑色->白色，透明->黑色）
+        black_pixels = (data[:, :, 0] == 0) & (data[:, :, 1] == 0) & (data[:, :, 2] == 0)
+        data[black_pixels, :3] = [255, 255, 255]
+        transparent_pixels = (data[:, :, 3] == 0)
+        data[transparent_pixels, :3] = [0, 0, 0]
+        mask_image = Image.fromarray(data)
+        mask_image = get_image_latent(mask_image, sample_size=[height, width])[:, :1, 0]
+        # 提取背景图像
+        inpaint_image = load_image(image["background"])
+        inpaint_image = get_image_latent(inpaint_image, sample_size=[height, width])[:, :, 0]
+    else:
+        inpaint_image = torch.zeros([1, 3, height, width])
+        mask_image = torch.ones([1, 1, height, width]) * 255
+    if control_image is not None:
+        control_image = get_image_latent(control_image, sample_size=[height, width])[:, :, 0]
+    else:
+        control_image = torch.zeros([1, 3, height, width])
     for i in range(batch_images):
         if stop_generation:
             stop_generation = False
@@ -275,14 +371,17 @@ def generate_con(
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"outputs/{timestamp}.png"
         output = pipe(
+            prompt=prompt,
             height=height,
             width=width,
             num_inference_steps=num_inference_steps, 
             guidance_scale=0.0, 
             generator=torch.Generator().manual_seed(seed+i),
-            prompt_embeds=prompt_embeds,
-            control_image = control_image,
-            control_context_scale = strength,
+            #prompt_embeds=prompt_embeds,
+            image=inpaint_image,
+            mask_image=mask_image,
+            control_image=control_image,
+            control_context_scale=strength,
         )
         image = output.images[0]
         image.save(filename)
@@ -334,7 +433,28 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                     info_t2i = gr.Textbox(label="提示信息", interactive=False)
                     image_output_t2i = gr.Gallery(label="生成结果", interactive=False)
                     stop_button_t2i = gr.Button("中止生成", variant="stop")
-        with gr.TabItem("ControlNet"):
+        """with gr.TabItem("图生图"):
+            with gr.Row():
+                with gr.Column():
+                    image_i2i = gr.Image(label="输入图片", type="pil", height=300)
+                    prompt_i2i = gr.Textbox(label="提示词", placeholder="请输入提示词...")
+                    generate_button_i2i = gr.Button("🖼️ 开始生成", variant='primary', scale=4)
+                    with gr.Accordion("参数设置", open=True):
+                        with gr.Row():
+                            width_i2i = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
+                            height_i2i = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
+                        with gr.Row():
+                            exchange_button_i2i = gr.Button("🔄 交换宽高")
+                            scale_1_5_button_i2i = gr.Button("1.5倍分辨率")
+                        strength_i2i = gr.Slider(label="strength（推荐0.6）", minimum=0, maximum=1, step=0.01, value=0.6)
+                        batch_images_i2i = gr.Slider(label="批量生成", minimum=1, maximum=100, step=1, value=1)
+                        num_inference_steps_i2i = gr.Slider(label="采样步数（推荐9步）", minimum=1, maximum=100, step=1, value=9)
+                        seed_param_i2i = gr.Number(label="种子，请输入自然数，-1为随机", value=-1)
+                with gr.Column():
+                    info_i2i = gr.Textbox(label="提示信息", interactive=False)
+                    image_output_i2i = gr.Gallery(label="生成结果", interactive=False)
+                    stop_button_i2i = gr.Button("中止生成", variant="stop")"""
+        """with gr.TabItem("ControlNet"):
             with gr.Row():
                 with gr.Column():
                     image_con = gr.Image(label="输入控制图片（支持Canny、HED、Depth、Pose、MLSD）", type="pil", height=300)
@@ -354,8 +474,30 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                 with gr.Column():
                     info_con = gr.Textbox(label="提示信息", interactive=False)
                     image_output_con = gr.Gallery(label="生成结果", interactive=False)
-                    stop_button_con = gr.Button("中止生成", variant="stop")
-        
+                    stop_button_con = gr.Button("中止生成", variant="stop")"""
+        with gr.TabItem("ControlNet&Inpaint"):
+            with gr.Row():
+                with gr.Column():
+                    image_inp = gr.ImageMask(label="输入修改图片和蒙版", type="pil", height=400)
+                    image_coni = gr.Image(label="输入控制图片（支持Canny、HED、Depth、Pose、MLSD）", type="pil", height=300)
+                    prompt_coni = gr.Textbox(label="提示词", placeholder="请输入提示词...")
+                    generate_button_coni = gr.Button("🖼️ 开始生成", variant='primary', scale=4)
+                    with gr.Accordion("参数设置", open=True):
+                        with gr.Row():
+                            width_coni = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
+                            height_coni = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
+                        with gr.Row():
+                            exchange_button_coni = gr.Button("🔄 交换宽高")
+                            scale_1_5_button_coni = gr.Button("1.5倍分辨率")
+                        strength_coni = gr.Slider(label="strength（推荐0.75）", minimum=0, maximum=1, step=0.01, value=0.75)
+                        batch_images_coni = gr.Slider(label="批量生成", minimum=1, maximum=100, step=1, value=1)
+                        num_inference_steps_coni = gr.Slider(label="采样步数（推荐9步）", minimum=1, maximum=100, step=1, value=9)
+                        seed_param_coni = gr.Number(label="种子，请输入自然数，-1为随机", value=-1)
+                with gr.Column():
+                    info_coni = gr.Textbox(label="提示信息", interactive=False)
+                    image_output_coni = gr.Gallery(label="生成结果", interactive=False)
+                    stop_button_coni = gr.Button("中止生成", variant="stop")
+    # 文生图  
     gr.on(
         triggers=[generate_button_t2i.click, prompt_t2i.submit],
         fn = generate_t2i,
@@ -386,12 +528,49 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
         inputs=[], 
         outputs=[info_t2i]
     )
+    # 图生图  
+    """gr.on(
+        triggers=[generate_button_i2i.click, prompt_i2i.submit],
+        fn = generate_i2i,
+        inputs = [
+            image_i2i,
+            prompt_i2i,
+            width_i2i,
+            height_i2i,
+            strength_i2i,
+            num_inference_steps_i2i,
+            batch_images_i2i,
+            seed_param_i2i,
+            lora_dropdown, 
+            lora_weights,
+        ],
+        outputs = [image_output_i2i, info_i2i]
+    )
+    exchange_button_i2i.click(
+        fn=exchange_width_height, 
+        inputs=[width_i2i, height_i2i], 
+        outputs=[width_i2i, height_i2i, info_i2i]
+    )
+    scale_1_5_button_i2i.click(
+        fn=scale_resolution_1_5,
+        inputs=[width_i2i, height_i2i],
+        outputs=[width_i2i, height_i2i, info_i2i]
+    )
+    stop_button_i2i.click(
+        fn=stop_generate, 
+        inputs=[], 
+        outputs=[info_i2i]
+    )
+    image_i2i.upload(
+        fn=adjust_width_height, 
+        inputs=[image_i2i], 
+        outputs=[width_i2i, height_i2i, info_i2i]
+    )"""
     # ControlNet
-    gr.on(
+    """gr.on(
         triggers=[generate_button_con.click, prompt_con.submit],
         fn = generate_con,
         inputs = [
-            image_con,
             prompt_con,
             width_con,
             height_con,
@@ -401,6 +580,7 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
             seed_param_con,
             lora_dropdown, 
             lora_weights,
+            image_con,
         ],
         outputs = [image_output_con, info_con]
     )
@@ -423,6 +603,45 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
         fn=adjust_width_height, 
         inputs=[image_con], 
         outputs=[width_con, height_con, info_con]
+    )"""
+    # ControlNet-Inpaint
+    gr.on(
+        triggers=[generate_button_coni.click, prompt_coni.submit],
+        fn = generate_con,
+        inputs = [
+            prompt_coni,
+            width_coni,
+            height_coni,
+            num_inference_steps_coni,
+            strength_coni,
+            batch_images_coni,
+            seed_param_coni,
+            lora_dropdown, 
+            lora_weights,
+            image_coni,
+            image_inp,
+        ],
+        outputs = [image_output_coni, info_coni]
+    )
+    exchange_button_coni.click(
+        fn=exchange_width_height, 
+        inputs=[width_coni, height_coni], 
+        outputs=[width_coni, height_coni, info_coni]
+    )
+    scale_1_5_button_coni.click(
+        fn=scale_resolution_1_5,
+        inputs=[width_coni, height_coni],
+        outputs=[width_coni, height_coni, info_coni]
+    )
+    stop_button_coni.click(
+        fn=stop_generate, 
+        inputs=[], 
+        outputs=[info_coni]
+    )
+    image_coni.upload(
+        fn=adjust_width_height, 
+        inputs=[image_coni], 
+        outputs=[width_coni, height_coni, info_coni]
     )
 
 if __name__ == "__main__": 

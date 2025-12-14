@@ -11,9 +11,9 @@ Z-Image的diffusers版本
 ## 安装依赖
 ```
 git clone https://github.com/gluttony-10/Z-Image-diffusers
-cd Tongbi
-conda create -n Tongbi python=3.12
-conda activate Tongbi
+cd Z-Image-diffusers
+conda create -n Z-Image-diffusers python=3.12
+conda activate Z-Image-diffusers
 pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
 ```
 ## 下载模型
@@ -28,3 +28,5 @@ python glut.py
 https://github.com/Tongyi-MAI/Z-Image
 
 https://github.com/aigc-apps/VideoX-Fun
+
+
