@@ -1,5 +1,6 @@
 import os
 import gc
+import time
 from PIL import Image
 import math
 from mmgp import offload
@@ -48,15 +49,30 @@ else:
     print(f'\033[32mCUDA不可用，请检查\033[0m')
     device = "cpu"
 
+# 启用 CUDA 加速优化
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True  # 自动寻找最优卷积算法
+    torch.backends.cuda.matmul.allow_tf32 = True  # 允许 TF32 矩阵乘法
+    torch.backends.cudnn.allow_tf32 = True  # 允许 TF32 加速
+
 os.makedirs("outputs", exist_ok=True)
 repo_id = "./models/Z-Image-Turbo"
-budgets = int(torch.cuda.get_device_properties(0).total_memory/1048576 - args.res_vram)
+if torch.cuda.is_available():
+    budgets = int(torch.cuda.get_device_properties(0).total_memory/1048576 - args.res_vram)
+else:
+    budgets = 0
 stop_generation = False
 mode_loaded = None
 pipe = None
 mmgp = None
 lora_loaded = None
 lora_loaded_weights = None
+# 提示词缓存
+prompt_embeds_cache = {
+    "key": None,
+    "prompt_embeds": None,
+    "prompt_embeds_mask": None,
+}
 lora_dir = "models/lora"
 if os.path.exists(lora_dir):
     lora_files = [f for f in os.listdir(lora_dir) if f.endswith(".safetensors")]
@@ -77,7 +93,7 @@ def load_model(mode, lora_dropdown, lora_weights):
         if pipe is not None:
             mmgp.release()
         transformer = offload.fast_load_transformers_model(
-            f"{repo_id}/transformer/mmgp.safetensors",
+            f"{repo_id}/transformer/mmgp-image-turbo.safetensors",
             do_quantize=False,
             modelClass=ZImageTransformer2DModel,
             forcedConfigPath=f"{repo_id}/transformer/config.json",
@@ -90,16 +106,16 @@ def load_model(mode, lora_dropdown, lora_weights):
             low_cpu_mem_usage=False, 
         )
         load_lora(lora_dropdown, lora_weights)
-    elif mode == "i2i":
+    elif mode == "t2i_image":
         if pipe is not None:
             mmgp.release()
         transformer = offload.fast_load_transformers_model(
-            f"{repo_id}/transformer/mmgp.safetensors",
+            f"{repo_id}/transformer/mmgp-image.safetensors",
             do_quantize=False,
             modelClass=ZImageTransformer2DModel,
             forcedConfigPath=f"{repo_id}/transformer/config.json",
         )
-        pipe = ZImageImg2ImgPipeline.from_pretrained(
+        pipe = ZImagePipeline.from_pretrained(
             repo_id, 
             text_encoder=text_encoder,
             transformer=transformer,
@@ -140,13 +156,9 @@ def load_model(mode, lora_dropdown, lora_weights):
         extraModelsToQuantize = ["text_encoder"],
         compile=True if args.compile else False,
     )
-    if torch.cuda.get_device_capability()[0] >= 8:
-        pipe.transformer.set_attention_backend("flash")
-    else:
-        pipe.transformer.set_attention_backend("native")
     """offload.save_model(
         model=pipe.transformer, 
-        file_path=f"{repo_id}/transformer/mmgp-con.safetensors", 
+        file_path=f"{repo_id}/transformer/mmgp-image.safetensors", 
         config_file_path=f"{repo_id}/transformer/config.json",
     )"""
     """offload.save_model(
@@ -218,6 +230,34 @@ def scale_resolution_1_5(width, height):
     return new_width, new_height, "✅ 分辨率已调整为1.5倍"
 
 
+def get_cached_prompt_embeds(prompt, negative_prompt=None):
+    """获取缓存的 prompt_embeds，避免重复编码"""
+    global prompt_embeds_cache, prompt_cache
+    
+    # 生成缓存键（包含 negative_prompt）
+    cache_key = (prompt, negative_prompt)
+    
+    # 检查缓存
+    if prompt_embeds_cache["key"] == cache_key and prompt_embeds_cache["prompt_embeds"] is not None:
+        print("📦 使用缓存的 prompt_embeds")
+        return prompt_embeds_cache["prompt_embeds"], prompt_embeds_cache["prompt_embeds_mask"]
+    
+    # 编码新的提示词
+    print("🔄 编码提示词...")
+    with torch.inference_mode():
+        if negative_prompt:
+            prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(prompt, negative_prompt=negative_prompt)
+        else:
+            prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(prompt)
+    
+    # 更新缓存
+    prompt_embeds_cache["key"] = cache_key
+    prompt_embeds_cache["prompt_embeds"] = prompt_embeds
+    prompt_embeds_cache["prompt_embeds_mask"] = prompt_embeds_mask
+    
+    return prompt_embeds, prompt_embeds_mask
+
+
 def generate_t2i(
     prompt, 
     width, 
@@ -233,35 +273,131 @@ def generate_t2i(
         load_model("t2i", lora_dropdown, lora_weights)
         mode_loaded = "t2i"
         lora_loaded, lora_loaded_weights = lora_dropdown, lora_weights
+        # 模型切换时清除缓存
+        global prompt_embeds_cache
+        prompt_embeds_cache = {"key": None, "prompt_embeds": None, "prompt_embeds_mask": None}
     results = []
     if seed_param < 0:
         seed = random.randint(0, np.iinfo(np.int32).max)
     else:
         seed = seed_param
-    prompt_embeds, _ = pipe.encode_prompt(prompt)
+    prompt_embeds, _ = get_cached_prompt_embeds(prompt)
+    total_start_time = time.time()
+    inference_times = []
     for i in range(batch_images):
         if stop_generation:
             stop_generation = False
             yield results, f"✅ 生成已中止，最后种子数{seed+i-1}"
             break
+        img_start_time = time.time()
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"outputs/{timestamp}.png"
-        output = pipe(
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps, 
-            guidance_scale=0.0, 
-            generator=torch.Generator().manual_seed(seed+i),
-            prompt_embeds=prompt_embeds,
-        )
+        with torch.inference_mode():
+            output = pipe(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps, 
+                guidance_scale=0.0, 
+                generator=torch.Generator().manual_seed(seed+i),
+                prompt_embeds=prompt_embeds,
+            )
         image = output.images[0]
         image.save(filename)
         results.append(image)
-        yield results, f"种子数{seed+i}，保存地址{filename}"
+        
+        # 计算单张图生成时间
+        img_time = time.time() - img_start_time
+        inference_times.append(img_time)
+        
+        # 显示进度信息：种子、保存路径、耗时
+        msg = f"✅ 第{i+1}/{batch_images}张完成，种子{seed+i}，耗时{img_time:.2f}秒 | 保存至: {filename}"
+        print(msg)
+        yield results, msg
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+    
+    # 生成完成后显示总结信息
+    if results:
+        total_time = time.time() - total_start_time
+        avg_time = total_time / len(results) if results else 0
+        msg = f"🎉 全部完成！共{len(results)}张，总耗时{total_time:.2f}秒，平均{avg_time:.2f}秒/张"
+        print(msg)
+        yield results, msg
+
+
+def generate_t2i_image(
+    prompt,
+    negative_prompt,
+    width, 
+    height, 
+    num_inference_steps, 
+    batch_images, 
+    seed_param, 
+    lora_dropdown, 
+    lora_weights,
+    guidance_scale,
+):
+    global stop_generation, mode_loaded, lora_loaded, lora_loaded_weights
+    if mode_loaded != "t2i_image" or lora_loaded != lora_dropdown or lora_loaded_weights != lora_weights:
+        load_model("t2i_image", lora_dropdown, lora_weights)
+        mode_loaded = "t2i_image"
+        lora_loaded, lora_loaded_weights = lora_dropdown, lora_weights
+        # 模型切换时清除缓存
+        global prompt_embeds_cache
+        prompt_embeds_cache = {"key": None, "prompt_embeds": None, "prompt_embeds_mask": None}
+    results = []
+    if seed_param < 0:
+        seed = random.randint(0, np.iinfo(np.int32).max)
+    else:
+        seed = seed_param
+    total_start_time = time.time()
+    inference_times = []
+    for i in range(batch_images):
+        if stop_generation:
+            stop_generation = False
+            yield results, f"✅ 生成已中止，最后种子数{seed+i-1}"
+            break
+        img_start_time = time.time()
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"outputs/{timestamp}.png"
+        generator = torch.Generator("cuda" if torch.cuda.is_available() else "cpu").manual_seed(seed+i)
+        with torch.inference_mode():
+            output = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt if negative_prompt else None,
+                height=height,
+                width=width,
+                cfg_normalization=False,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            )
+        image = output.images[0]
+        image.save(filename)
+        results.append(image)
+        
+        # 计算单张图生成时间
+        img_time = time.time() - img_start_time
+        inference_times.append(img_time)
+        
+        # 显示进度信息：种子、保存路径、耗时
+        msg = f"✅ 第{i+1}/{batch_images}张完成，种子{seed+i}，耗时{img_time:.2f}秒 | 保存至: {filename}"
+        print(msg)
+        yield results, msg
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    
+    # 生成完成后显示总结信息
+    if results:
+        total_time = time.time() - total_start_time
+        avg_time = total_time / len(results) if results else 0
+        msg = f"🎉 全部完成！共{len(results)}张，总耗时{total_time:.2f}秒，平均{avg_time:.2f}秒/张"
+        print(msg)
+        yield results, msg
 
 
 def generate_i2i(
@@ -281,40 +417,63 @@ def generate_i2i(
         load_model("i2i", lora_dropdown, lora_weights)
         mode_loaded = "i2i"
         lora_loaded, lora_loaded_weights = lora_dropdown, lora_weights
+        # 模型切换时清除缓存
+        global prompt_embeds_cache
+        prompt_embeds_cache = {"key": None, "prompt_embeds": None, "prompt_embeds_mask": None}
     results = []
     if seed_param < 0:
         seed = random.randint(0, np.iinfo(np.int32).max)
     else:
         seed = seed_param
-    #prompt_embeds, _ = pipe.encode_prompt(prompt)
+    prompt_embeds, _ = get_cached_prompt_embeds(prompt)
     if init_image.size != (width, height):
         init_image = init_image.resize((width, height))
+    total_start_time = time.time()
+    inference_times = []
     for i in range(batch_images):
         if stop_generation:
             stop_generation = False
             yield results, f"✅ 生成已中止，最后种子数{seed+i-1}"
             break
+        img_start_time = time.time()
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"outputs/{timestamp}.png"
-        output = pipe(
-            image=init_image,
-            prompt=prompt,
-            height=height,
-            width=width,
-            strength=strength,
-            num_inference_steps=num_inference_steps, 
-            guidance_scale=0.0, 
-            generator=torch.Generator().manual_seed(seed+i),
-            #prompt_embeds=prompt_embeds,
-        )
+        with torch.inference_mode():
+            output = pipe(
+                image=init_image,
+                prompt=prompt,
+                height=height,
+                width=width,
+                strength=strength,
+                num_inference_steps=num_inference_steps, 
+                guidance_scale=0.0, 
+                generator=torch.Generator().manual_seed(seed+i),
+                prompt_embeds=prompt_embeds,
+            )
         image = output.images[0]
         image.save(filename)
         results.append(image)
-        yield results, f"种子数{seed+i}，保存地址{filename}"
+        
+        # 计算单张图生成时间
+        img_time = time.time() - img_start_time
+        inference_times.append(img_time)
+        
+        # 显示进度信息：种子、保存路径、耗时
+        msg = f"✅ 第{i+1}/{batch_images}张完成，种子{seed+i}，耗时{img_time:.2f}秒 | 保存至: {filename}"
+        print(msg)
+        yield results, msg
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+    
+    # 生成完成后显示总结信息
+    if results:
+        total_time = time.time() - total_start_time
+        avg_time = total_time / len(results) if results else 0
+        msg = f"🎉 全部完成！共{len(results)}张，总耗时{total_time:.2f}秒，平均{avg_time:.2f}秒/张"
+        print(msg)
+        yield results, msg
 
 
 def generate_con(
@@ -335,12 +494,15 @@ def generate_con(
         load_model("con", lora_dropdown, lora_weights)
         mode_loaded = "con"
         lora_loaded, lora_loaded_weights = lora_dropdown, lora_weights
+        # 模型切换时清除缓存
+        global prompt_embeds_cache
+        prompt_embeds_cache = {"key": None, "prompt_embeds": None, "prompt_embeds_mask": None}
     results = []
     if seed_param < 0:
         seed = random.randint(0, np.iinfo(np.int32).max)
     else:
         seed = seed_param
-    prompt_embeds, _ = pipe.encode_prompt(prompt)
+    prompt_embeds, _ = get_cached_prompt_embeds(prompt)
     if image["background"] is not None:
         # 处理蒙版图像
         mask_image = image["layers"][0]
@@ -363,34 +525,54 @@ def generate_con(
         control_image = get_image_latent(control_image, sample_size=[height, width])[:, :, 0]
     else:
         control_image = torch.zeros([1, 3, height, width])
+    total_start_time = time.time()
+    inference_times = []
     for i in range(batch_images):
         if stop_generation:
             stop_generation = False
             yield results, f"✅ 生成已中止，最后种子数{seed+i-1}"
             break
+        img_start_time = time.time()
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"outputs/{timestamp}.png"
-        output = pipe(
-            prompt=prompt,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps, 
-            guidance_scale=0.0, 
-            generator=torch.Generator().manual_seed(seed+i),
-            #prompt_embeds=prompt_embeds,
-            image=inpaint_image,
-            mask_image=mask_image,
-            control_image=control_image,
-            control_context_scale=strength,
-        )
+        with torch.inference_mode():
+            output = pipe(
+                prompt=prompt,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps, 
+                guidance_scale=0.0, 
+                generator=torch.Generator().manual_seed(seed+i),
+                prompt_embeds=prompt_embeds,
+                image=inpaint_image,
+                mask_image=mask_image,
+                control_image=control_image,
+                control_context_scale=strength,
+            )
         image = output.images[0]
         image.save(filename)
         results.append(image)
-        yield results, f"种子数{seed+i}，保存地址{filename}"
+        
+        # 计算单张图生成时间
+        img_time = time.time() - img_start_time
+        inference_times.append(img_time)
+        
+        # 显示进度信息：种子、保存路径、耗时
+        msg = f"✅ 第{i+1}/{batch_images}张完成，种子{seed+i}，耗时{img_time:.2f}秒 | 保存至: {filename}"
+        print(msg)
+        yield results, msg
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
+    
+    # 生成完成后显示总结信息
+    if results:
+        total_time = time.time() - total_start_time
+        avg_time = total_time / len(results) if results else 0
+        msg = f"🎉 全部完成！共{len(results)}张，总耗时{total_time:.2f}秒，平均{avg_time:.2f}秒/张"
+        print(msg)
+        yield results, msg
     
 
 with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.GoogleFont("IBM Plex Sans")])) as demo:
@@ -414,15 +596,15 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                 lora_dropdown = gr.Dropdown(label="LoRA模型", info="存放LoRA模型到models/lora，可多选", choices=lora_choices, multiselect=True)
                 lora_weights = gr.Textbox(label="LoRA权重", info="Lora权重，多个权重请用英文逗号隔开。例如：0.8,0.5,0.2", value="")
     with gr.Tabs():
-        with gr.TabItem("文生图"):
+        with gr.TabItem("文生图（Turbo）"):
             with gr.Row():
                 with gr.Column():
                     prompt_t2i = gr.Textbox(label="提示词", placeholder="请输入提示词...")
                     generate_button_t2i = gr.Button("🖼️ 开始生成", variant='primary', scale=4)
                     with gr.Accordion("参数设置", open=True):
                         with gr.Row():
-                            width_t2i = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
-                            height_t2i = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
+                            width_t2i = gr.Slider(label="宽度", minimum=256, maximum=3072, step=16, value=1024)
+                            height_t2i = gr.Slider(label="高度", minimum=256, maximum=3072, step=16, value=1024)
                         with gr.Row():
                             exchange_button_t2i = gr.Button("🔄 交换宽高")
                             scale_1_5_button_t2i = gr.Button("1.5倍分辨率")
@@ -433,6 +615,27 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                     info_t2i = gr.Textbox(label="提示信息", interactive=False)
                     image_output_t2i = gr.Gallery(label="生成结果", interactive=False)
                     stop_button_t2i = gr.Button("中止生成", variant="stop")
+        with gr.TabItem("文生图（Image）"):
+            with gr.Row():
+                with gr.Column():
+                    prompt_t2i_image = gr.Textbox(label="提示词", placeholder="请输入提示词...")
+                    negative_prompt_t2i_image = gr.Textbox(label="负面提示词", placeholder="请输入负面提示词...", value="")
+                    generate_button_t2i_image = gr.Button("🖼️ 开始生成", variant='primary', scale=4)
+                    with gr.Accordion("参数设置", open=True):
+                        with gr.Row():
+                            width_t2i_image = gr.Slider(label="宽度", minimum=256, maximum=3072, step=16, value=1024)
+                            height_t2i_image = gr.Slider(label="高度", minimum=256, maximum=3072, step=16, value=1024)
+                        with gr.Row():
+                            exchange_button_t2i_image = gr.Button("🔄 交换宽高")
+                            scale_1_5_button_t2i_image = gr.Button("1.5倍分辨率")
+                        batch_images_t2i_image = gr.Slider(label="批量生成", minimum=1, maximum=100, step=1, value=1)
+                        num_inference_steps_t2i_image = gr.Slider(label="采样步数（推荐50步）", minimum=1, maximum=100, step=1, value=50)
+                        guidance_scale_t2i_image = gr.Slider(label="guidance_scale", minimum=0, maximum=10, step=0.1, value=4)
+                        seed_param_t2i_image = gr.Number(label="种子，请输入自然数，-1为随机", value=-1)
+                with gr.Column():
+                    info_t2i_image = gr.Textbox(label="提示信息", interactive=False)
+                    image_output_t2i_image = gr.Gallery(label="生成结果", interactive=False)
+                    stop_button_t2i_image = gr.Button("中止生成", variant="stop")
         """with gr.TabItem("图生图"):
             with gr.Row():
                 with gr.Column():
@@ -441,8 +644,8 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                     generate_button_i2i = gr.Button("🖼️ 开始生成", variant='primary', scale=4)
                     with gr.Accordion("参数设置", open=True):
                         with gr.Row():
-                            width_i2i = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
-                            height_i2i = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
+                            width_i2i = gr.Slider(label="宽度", minimum=256, maximum=3072, step=16, value=1024)
+                            height_i2i = gr.Slider(label="高度", minimum=256, maximum=3072, step=16, value=1024)
                         with gr.Row():
                             exchange_button_i2i = gr.Button("🔄 交换宽高")
                             scale_1_5_button_i2i = gr.Button("1.5倍分辨率")
@@ -462,8 +665,8 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                     generate_button_con = gr.Button("🖼️ 开始生成", variant='primary', scale=4)
                     with gr.Accordion("参数设置", open=True):
                         with gr.Row():
-                            width_con = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
-                            height_con = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
+                            width_con = gr.Slider(label="宽度", minimum=256, maximum=3072, step=16, value=1024)
+                            height_con = gr.Slider(label="高度", minimum=256, maximum=3072, step=16, value=1024)
                         with gr.Row():
                             exchange_button_con = gr.Button("🔄 交换宽高")
                             scale_1_5_button_con = gr.Button("1.5倍分辨率")
@@ -484,8 +687,8 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                     generate_button_coni = gr.Button("🖼️ 开始生成", variant='primary', scale=4)
                     with gr.Accordion("参数设置", open=True):
                         with gr.Row():
-                            width_coni = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
-                            height_coni = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
+                            width_coni = gr.Slider(label="宽度", minimum=256, maximum=3072, step=16, value=1024)
+                            height_coni = gr.Slider(label="高度", minimum=256, maximum=3072, step=16, value=1024)
                         with gr.Row():
                             exchange_button_coni = gr.Button("🔄 交换宽高")
                             scale_1_5_button_coni = gr.Button("1.5倍分辨率")
@@ -497,7 +700,7 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
                     info_coni = gr.Textbox(label="提示信息", interactive=False)
                     image_output_coni = gr.Gallery(label="生成结果", interactive=False)
                     stop_button_coni = gr.Button("中止生成", variant="stop")
-    # 文生图  
+    # 文生图（Turbo）
     gr.on(
         triggers=[generate_button_t2i.click, prompt_t2i.submit],
         fn = generate_t2i,
@@ -527,6 +730,39 @@ with gr.Blocks(title="Z-Image-diffusers", theme=gr.themes.Soft(font=[gr.themes.G
         fn=stop_generate, 
         inputs=[], 
         outputs=[info_t2i]
+    )
+    # 文生图（Image）
+    gr.on(
+        triggers=[generate_button_t2i_image.click, prompt_t2i_image.submit, negative_prompt_t2i_image.submit],
+        fn = generate_t2i_image,
+        inputs = [
+            prompt_t2i_image,
+            negative_prompt_t2i_image,
+            width_t2i_image,
+            height_t2i_image,
+            num_inference_steps_t2i_image,
+            batch_images_t2i_image,
+            seed_param_t2i_image,
+            lora_dropdown, 
+            lora_weights,
+            guidance_scale_t2i_image,
+        ],
+        outputs = [image_output_t2i_image, info_t2i_image]
+    )
+    exchange_button_t2i_image.click(
+        fn=exchange_width_height, 
+        inputs=[width_t2i_image, height_t2i_image], 
+        outputs=[width_t2i_image, height_t2i_image, info_t2i_image]
+    )
+    scale_1_5_button_t2i_image.click(
+        fn=scale_resolution_1_5,
+        inputs=[width_t2i_image, height_t2i_image],
+        outputs=[width_t2i_image, height_t2i_image, info_t2i_image]
+    )
+    stop_button_t2i_image.click(
+        fn=stop_generate, 
+        inputs=[], 
+        outputs=[info_t2i_image]
     )
     # 图生图  
     """gr.on(
